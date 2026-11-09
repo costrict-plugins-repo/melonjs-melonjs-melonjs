@@ -1,0 +1,436 @@
+/**
+ * `me.audio` — the audio module's public surface.
+ *
+ * Composition:
+ * - {@link ./backend.ts} — shared internal state + the two WebAudio
+ *   escape hatches (`getAudioContext`, `getMasterGain`) + the
+ *   `stopOnAudioError` flag.
+ * - {@link ./playback.ts} — file-based playback (`load`, `play`,
+ *   `pause`, `resume`, `stop`, `fade`, `seek`, `rate`, `stereo`,
+ *   `position`, `orientation`, `panner`).
+ * - {@link ./procedural.ts} — procedural primitives (`tone`, `noise`).
+ * - {@link ./spatial.ts} — the world-space layer: a movable listener,
+ *   sounds that follow a renderable, and the pixel-shaped defaults.
+ * - {@link ./autopause.ts} — silencing the mix while the window is away.
+ * - {@link ./types.ts} — public TypeScript shapes.
+ *
+ * This file owns the remaining lifecycle / track / mix / unload
+ * helpers, plus the barrel re-exports that compose the namespace.
+ */
+
+import { play } from "./playback.ts";
+import { releaseSpatialClip } from "./spatial.ts";
+import {
+	state as audioState,
+	getGlobalVolume,
+	getSoundOrThrow,
+	hasCodec,
+	isAudioAvailable,
+	isGlobalMuted,
+	setGlobalMuted,
+	setGlobalVolume,
+} from "./state.ts";
+import type { TrackOptions } from "./types.ts";
+
+export {
+	duration,
+	fade,
+	load,
+	orientation,
+	panner,
+	pause,
+	play,
+	playing,
+	position,
+	rate,
+	resume,
+	seek,
+	state,
+	stereo,
+	stop,
+} from "./playback.ts";
+export { noise, tone } from "./procedural.ts";
+
+export {
+	getSpatialDefaults,
+	listener,
+	listenerOrientation,
+	setListener,
+	setSpatialDefaults,
+	unfollow,
+} from "./spatial.ts";
+// Public re-exports from the split modules.
+export {
+	getAudioContext,
+	getMasterGain,
+	setStopOnAudioError,
+	stopOnAudioError,
+} from "./state.ts";
+// Public type surface.
+export type {
+	LoadSettings,
+	NoiseFilter,
+	NoiseOptions,
+	PannerAttributes,
+	SoundAsset,
+	ToneOptions,
+	TrackOptions,
+} from "./types.ts";
+
+/**
+ * Initialize and configure the audio module.
+ *
+ * For maximum browser coverage, list at least two formats — typically
+ * webm first then mp3. Webm has near-universal modern coverage with
+ * great compression / quality balance; mp3 covers older browsers.
+ * Order matters: melonJS picks the first compatible format from the
+ * list, so put the preferred one first.
+ * @param format - Comma-separated audio formats to prioritize.
+ *   One or more of: `"mp3"`, `"mpeg"`, `"opus"`, `"ogg"`, `"oga"`,
+ *   `"wav"`, `"aac"`, `"caf"`, `"m4a"`, `"m4b"`, `"mp4"`, `"weba"`,
+ *   `"webm"`, `"dolby"`, `"flac"`. Defaults to `"mp3"`.
+ * @returns `true` when audio support was successfully initialised.
+ * @example
+ * // initialise with webm preferred, mp3 as fallback
+ * if (!me.audio.init("webm,mp3")) {
+ *     alert("Sorry but your browser does not support html 5 audio !");
+ *     return;
+ * }
+ * @category Audio
+ */
+export function init(format: string = "mp3"): boolean {
+	audioState.audioExts = format.split(",");
+	return isAudioAvailable();
+}
+
+/**
+ * Check whether the given audio codec is supported by the browser.
+ * @param codec - The audio format to check.
+ * @returns `true` when the format is supported.
+ * @category Audio
+ */
+export function hasFormat(codec: string): boolean {
+	return hasCodec(codec);
+}
+
+/**
+ * Check whether audio (HTML5 or WebAudio) is supported by the browser.
+ * @returns `true` when at least one audio backend is available.
+ * @category Audio
+ */
+export function hasAudio(): boolean {
+	return isAudioAvailable();
+}
+
+/**
+ * Enable audio output. Only useful if audio is supported and was
+ * previously disabled through {@link disable}.
+ * @category Audio
+ */
+export function enable(): void {
+	unmuteAll();
+}
+
+/**
+ * Disable audio output.
+ * @category Audio
+ */
+export function disable(): void {
+	muteAll();
+}
+
+/**
+ * Play the specified audio track, **replacing** whatever track was playing.
+ *
+ * The clip loops, and its name becomes the current track for
+ * {@link stopTrack} / {@link pauseTrack} / {@link resumeTrack} /
+ * {@link getCurrentTrack}. The previous track is stopped first, so only one
+ * track is ever playing: there is a single current-track slot, and a track
+ * left running after the slot had moved on could no longer be reached by any
+ * of those four.
+ *
+ * Calling it with the name already playing restarts that track from the
+ * beginning, the same as {@link play} on any other clip. Scene code that
+ * wants the bed to carry on across a screen change should not call this
+ * again, rather than rely on it doing nothing.
+ *
+ * Use {@link play} for sound effects: they are meant to overlap, and nothing
+ * here applies to them.
+ * The track can be one region of the clip, from its `sprite` map. An MP3
+ * encoder pads the end of its file and Safari plays the padding, so a looping
+ * MP3 drops out for a moment at each loop there: a region of the loop's exact
+ * length keeps it gapless.
+ * @param sound_name - Audio track name (case-sensitive).
+ * @param volumeOrOptions - The track's own volume, `0.0..1.0` (defaults to
+ *   `1`; the global volume set with {@link setVolume} scales it on top), or a
+ *   {@link TrackOptions} object with `volume` and the `sprite` region to loop
+ *   on.
+ * @returns The sound instance ID.
+ * @throws {Error} when no clip of that name is loaded, raised before anything
+ *   is stopped, so a mistyped name cannot silence the music already playing.
+ * @example
+ * me.audio.playTrack("menu_theme");
+ * me.audio.playTrack("battle_theme");  // the menu theme stops
+ * @example
+ * // loop on a region of exactly 12 s, declared when the clip is loaded:
+ * // { name: "ambience", type: "audio", src: "sfx/", sprite: { loop: [0, 12000] } }
+ * me.audio.playTrack("ambience", { sprite: "loop", volume: 0.6 });
+ * @category Audio
+ */
+export function playTrack(
+	sound_name: string,
+	volumeOrOptions?: number | TrackOptions,
+): number {
+	const options: TrackOptions =
+		typeof volumeOrOptions === "object"
+			? volumeOrOptions
+			: { volume: volumeOrOptions };
+	const previousName = audioState.currentTrackId;
+	const previousVoice = audioState.currentTrackVoiceId;
+
+	// The new track STARTS first, and only then is the old one stopped.
+	//
+	// Both halves of that matter. `play` throws on a clip that was never
+	// loaded, and going first means a mistyped name throws with the music
+	// still playing rather than killing it and then throwing. And the old
+	// voice is stopped BY ID, which is what makes replacing a track with
+	// itself safe: `Sound#stop` queues while the clip is loading or the
+	// audio context is still locked, and a queued stop with no id resolves
+	// its ids when it finally runs — late enough to catch the replacement
+	// and leave the game silent.
+	//
+	// The whole clip is NAMED (`__default`, the backend's region for it)
+	// rather than left out. A play with no region is read by the backend as
+	// "resume the paused instance, if exactly one is paused", and with the
+	// track paused that instance is the track itself: it was resumed, its id
+	// came back, and the stop below then silenced it.
+	const id = play(sound_name, {
+		loop: true,
+		sprite: options.sprite ?? "__default",
+		volume: options.volume,
+	});
+	audioState.currentTrackId = sound_name;
+	audioState.currentTrackVoiceId = id;
+
+	if (previousName !== null && previousVoice !== undefined) {
+		audioState.tracks[previousName]?.stop(previousVoice);
+	}
+	return id;
+}
+
+/**
+ * Stop the current audio track, and leave no current track behind.
+ *
+ * Only needed where nothing else follows, since {@link playTrack} stops the
+ * track it replaces: a scene whose successor has no music of its own, or a
+ * game going quiet. A no-op when no track is playing.
+ * @see {@link playTrack}
+ * @example
+ * me.audio.playTrack("awesome_music");
+ * me.audio.stopTrack();
+ * @category Audio
+ */
+export function stopTrack(): void {
+	if (audioState.currentTrackId !== null) {
+		audioState.tracks[audioState.currentTrackId]?.stop();
+		audioState.currentTrackId = null;
+		audioState.currentTrackVoiceId = undefined;
+	}
+}
+
+/**
+ * Pause the current audio track.
+ * @example
+ * me.audio.pauseTrack();
+ * @category Audio
+ */
+export function pauseTrack(): void {
+	if (audioState.currentTrackId !== null) {
+		// the track's own voice: a bare pause() pauses every instance of the
+		// clip, effects played from the same file included
+		audioState.tracks[audioState.currentTrackId]?.pause(
+			audioState.currentTrackVoiceId,
+		);
+	}
+}
+
+/**
+ * Resume the previously paused audio track.
+ * @example
+ * me.audio.playTrack("awesome_music");
+ * me.audio.pauseTrack();
+ * me.audio.resumeTrack();
+ * @category Audio
+ */
+export function resumeTrack(): void {
+	if (audioState.currentTrackId === null) {
+		return;
+	}
+	const sound = audioState.tracks[audioState.currentTrackId];
+	if (sound === undefined) {
+		return;
+	}
+	const id = audioState.currentTrackVoiceId;
+	const voice = id === undefined ? null : sound._soundById(id);
+	if (id === undefined || voice === null || voice._ended) {
+		// no voice of the track left to resume (its clip was stopped): start
+		// the clip, which is what this has always done with nothing paused
+		sound.play();
+		return;
+	}
+	// The track's own voice, not a bare play(). That one resumes only when
+	// EXACTLY ONE instance of the clip is paused: with an effect of the same
+	// clip paused too it started the whole file again from the top, on a clip
+	// with a sprite map it threw, and with the track playing it layered a
+	// second copy of it.
+	if (sound._playLock || sound.state() !== "loaded") {
+		// The voice is still starting (its clip loading, or the context not
+		// running yet), so a pause was queued behind that start, and the
+		// resume queues behind the pause. Played now, it would start the
+		// voice a second time underneath the first.
+		sound._queue.push({
+			event: "play",
+			action: () => {
+				sound.play(id);
+			},
+		});
+		return;
+	}
+	if (voice._paused) {
+		sound.play(id);
+	}
+}
+
+/**
+ * Return the name of the current audio track, or `null` if none is set.
+ * @returns The current track name, or `null`.
+ * @category Audio
+ */
+export function getCurrentTrack(): string | null {
+	return audioState.currentTrackId;
+}
+
+/**
+ * Set the global volume: the master level every sound plays through, those
+ * already playing included. A sound's own volume, given to {@link play} or
+ * {@link playTrack}, is scaled by it, so at `0.5` a sound played at `0.8` is
+ * heard at `0.4`.
+ * @param volume - Volume value, `0.0..1.0`.
+ * @category Audio
+ */
+export function setVolume(volume: number): void {
+	setGlobalVolume(volume);
+}
+
+/**
+ * Get the default global volume.
+ * @returns The current volume value, `0.0..1.0`.
+ * @category Audio
+ */
+export function getVolume(): number {
+	return getGlobalVolume();
+}
+
+/**
+ * Mute or unmute the specified sound. Playback continues; only the
+ * audible output is suppressed.
+ * @param sound_name - Audio clip name (case-sensitive).
+ * @param id - Sound instance ID. When omitted, all sounds in the group
+ *   are affected.
+ * @param shouldMute - `true` to mute, `false` to unmute. Defaults to
+ *   `true`.
+ * @example
+ * // mute the background music
+ * me.audio.mute("awesome_music");
+ * @category Audio
+ */
+export function mute(
+	sound_name: string,
+	id?: number,
+	shouldMute: boolean = true,
+): void {
+	getSoundOrThrow(sound_name).mute(shouldMute, id);
+}
+
+/**
+ * Unmute the specified sound.
+ * @param sound_name - Audio clip name (case-sensitive).
+ * @param id - Sound instance ID. When omitted, all sounds in the group
+ *   are affected.
+ * @category Audio
+ */
+export function unmute(sound_name: string, id?: number): void {
+	mute(sound_name, id, false);
+}
+
+/**
+ * Mute all audio.
+ * @category Audio
+ */
+export function muteAll(): void {
+	setGlobalMuted(true);
+}
+
+/**
+ * Unmute all audio.
+ * @category Audio
+ */
+export function unmuteAll(): void {
+	setGlobalMuted(false);
+}
+
+/**
+ * Return whether audio is currently muted globally.
+ * @returns `true` when audio is muted globally.
+ * @category Audio
+ */
+export function muted(): boolean {
+	return isGlobalMuted();
+}
+
+/**
+ * Unload the specified audio track to free memory.
+ * @param sound_name - Audio track name (case-sensitive).
+ * @returns `true` when the track was found and unloaded.
+ * @example
+ * me.audio.unload("awesome_music");
+ * @category Audio
+ */
+export function unload(sound_name: string): boolean {
+	releaseSpatialClip(sound_name);
+	const sound = audioState.tracks[sound_name];
+	if (!sound) {
+		return false;
+	}
+
+	// forget the current-track pointer if it referenced this sound, so
+	// getCurrentTrack() / pauseTrack() / resumeTrack() don't act on a ghost
+	if (audioState.currentTrackId === sound_name) {
+		audioState.currentTrackId = null;
+		audioState.currentTrackVoiceId = undefined;
+	}
+
+	// destroy the backend Sound object
+	sound.unload();
+	delete audioState.tracks[sound_name];
+	// ...and its retry budget. Unloading a clip part-way through its retries
+	// otherwise left the counter behind, so reloading the same name inherited
+	// a used-up budget and gave up on its FIRST failure.
+	delete audioState.retryCounters[sound_name];
+	return true;
+}
+
+/**
+ * Unload every loaded audio track to free memory.
+ * @example
+ * me.audio.unloadAll();
+ * @category Audio
+ */
+export function unloadAll(): void {
+	releaseSpatialClip();
+	for (const sound_name in audioState.tracks) {
+		if (Object.prototype.hasOwnProperty.call(audioState.tracks, sound_name)) {
+			unload(sound_name);
+		}
+	}
+}
